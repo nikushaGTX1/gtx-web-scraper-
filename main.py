@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import sys
 import os
+import time
 from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
@@ -1517,6 +1518,143 @@ def excel_cell(worksheet, row, column):
     return worksheet.Range(f"{excel_column_letter(column)}{row}")
 
 
+def excel_color_is_dark(color):
+    """Return True for a visibly dark Excel fill color.
+
+    Excel exposes ``Interior.Color`` as a BGR integer.  Treating any dark
+    colour (rather than only the literal value 0) as a separator also covers
+    templates which use dark grey lines.
+    """
+
+    try:
+        color = int(color)
+    except (TypeError, ValueError):
+        return False
+
+    red = color & 0xFF
+    green = (color >> 8) & 0xFF
+    blue = (color >> 16) & 0xFF
+    return (red * 299 + green * 587 + blue * 114) / 1000 < 70
+
+
+def excel_cell_has_dark_fill(cell):
+    """Check both the stored and the visibly displayed (conditional) fill."""
+
+    interiors = []
+    try:
+        interiors.append(cell.DisplayFormat.Interior)
+    except Exception:
+        pass
+    try:
+        interiors.append(cell.Interior)
+    except Exception:
+        pass
+
+    for interior in interiors:
+        try:
+            # xlColorIndexNone (-4142) and xlColorIndexAutomatic (-4105) do
+            # not represent an intentionally painted separator cell.
+            color_index = int(interior.ColorIndex)
+            if color_index in (-4142, -4105):
+                continue
+        except Exception:
+            try:
+                if int(interior.Pattern) == -4142:
+                    continue
+            except Exception:
+                continue
+        try:
+            if excel_color_is_dark(interior.Color):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def excel_row_is_dark(worksheet, row, last_column):
+    """Detect a black/dark separator, including conditional formatting."""
+
+    for column in range(1, max(last_column, 1) + 1):
+        try:
+            if excel_cell_has_dark_fill(excel_cell(worksheet, row, column)):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def excel_row_has_merged_cells(worksheet, row, last_column):
+    """Merged template rows are headings/separators and cannot accept data."""
+
+    for column in range(1, max(last_column, 1) + 1):
+        try:
+            if bool(excel_cell(worksheet, row, column).MergeCells):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def find_excel_target_row(worksheet, id_column, last_column):
+    """Find the first genuinely writable data row, skipping dark dividers."""
+
+    try:
+        used_last_row = int(worksheet.UsedRange.Row + worksheet.UsedRange.Rows.Count - 1)
+    except Exception:
+        used_last_row = 1
+
+    # Formatting can make UsedRange enormous.  This generous cap still keeps
+    # a damaged template from causing a very long scan.
+    scan_limit = min(max(used_last_row + 100, 200), 100000)
+    row = 2
+    while row <= scan_limit:
+        has_id = bool(clean(excel_cell(worksheet, row, id_column).Value))
+        unusable = (
+            excel_row_is_dark(worksheet, row, last_column)
+            or excel_row_has_merged_cells(worksheet, row, last_column)
+        )
+        if not has_id and not unusable:
+            return row
+        row += 1
+
+    raise RuntimeError("Excel-ში თავისუფალი მონაცემების რიგი ვერ მოიძებნა")
+
+
+def save_excel_workbook(workbook, workbook_path):
+    """Save through multiple Excel-compatible paths and verify the result."""
+
+    errors = []
+    for attempt in range(3):
+        try:
+            workbook.Save()
+            if bool(workbook.Saved):
+                return
+        except Exception as error:
+            errors.append(error)
+        time.sleep(0.4 * (attempt + 1))
+
+    # SaveAs succeeds on some Excel installations where Save fails because
+    # the workbook was opened through Protected View/OneDrive indirection.
+    try:
+        workbook.SaveAs(
+            Filename=str(workbook_path),
+            FileFormat=int(workbook.FileFormat),
+            AddToMru=False,
+            Local=True,
+        )
+        if bool(workbook.Saved):
+            return
+    except Exception as error:
+        errors.append(error)
+
+    detail = str(errors[-1]) if errors else "უცნობი შეცდომა"
+    raise PermissionError(
+        "Excel-მა მონაცემები მიიღო, მაგრამ ბაზა.xlsx დისკზე ვერ შეინახა. "
+        "ფაილი სავარაუდოდ ჩაკეტილია, Read-only რეჟიმშია, ან Desktop-ის "
+        f"საქაღალდეზე ჩაწერის უფლება არ აქვს. დახურე ბაზა.xlsx და სცადე თავიდან. დეტალი: {detail}"
+    )
+
+
 EXCEL_COLUMN_ALIASES = {
     # ბაზა.xlsx column layout.  These are the fields marked „ავტო“ in row 2.
     "ბინის ID": ("მესაკუთრის ID",),
@@ -1642,12 +1780,16 @@ def save_to_excel(listing):
         # Column A keeps the workbook's existing visible heading, while the
         # apartment/listing ID is written into it.
         first_auto_column = headers.get(normalize_field_name("მესაკუთრის ID"), 1)
-        last_row = 1
-        while clean(excel_cell(worksheet, last_row + 1, first_auto_column).Value):
-            last_row += 1
-        target_row = max(last_row + 1, 2)
+        target_row = find_excel_target_row(
+            worksheet, first_auto_column, last_column
+        )
 
         print(f"Excel რიგი: {target_row}")
+
+        if bool(worksheet.ProtectContents):
+            raise PermissionError(
+                "Excel-ის პირველი ფურცელი დაცულია (Protect Sheet). მოხსენი დაცვა და თავიდან სცადე."
+            )
 
         for key, value in listing.items():
             # Column A is visibly named "მესაკუთრის ID" in the workbook for
@@ -1672,9 +1814,15 @@ def save_to_excel(listing):
                 # string (the apostrophe is not shown in the cell), preserving
                 # phone numbers and values such as "2 ოთახი 1 საძ".
                 text_value = clean(value) if value is not None else ""
-                cell.Value2 = f"'{text_value}" if text_value else ""
+                try:
+                    cell.Value2 = f"'{text_value}" if text_value else ""
+                except Exception as write_error:
+                    raise RuntimeError(
+                        f"ვერ ჩაიწერა უჯრაში {excel_column_letter(column)}{target_row} "
+                        f"(ველი: {key})"
+                    ) from write_error
 
-        workbook.Save()
+        save_excel_workbook(workbook, workbook_path)
         saved = True
         if not workbook.Saved:
             raise OSError("Excel ფაილის შენახვა ვერ დადასტურდა")
@@ -1683,10 +1831,11 @@ def save_to_excel(listing):
         print(f"Excel ბაზაში დამატებულია: {workbook_path}")
     except Exception as error:
         print(f"\nExcel-ში შენახვა ვერ მოხერხდა: {type(error).__name__}: {error}")
-        print(
-            "შეამოწმე, რომ Microsoft Excel დაყენებულია, ბაზა.xlsx არის "
-            "Desktop-ზე და ფაილი არ არის Protected View-ში."
-        )
+        if not isinstance(error, PermissionError):
+            print(
+                "შეამოწმე, რომ Microsoft Excel დაყენებულია, ბაზა.xlsx არის "
+                "Desktop-ზე და ფაილი არ არის Protected View-ში."
+            )
     finally:
         if workbook and not using_open_workbook:
             workbook.Close(SaveChanges=saved)
